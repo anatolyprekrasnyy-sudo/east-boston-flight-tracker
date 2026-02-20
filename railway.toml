@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python3 server.py"
+healthcheckPath = "/api/status"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"

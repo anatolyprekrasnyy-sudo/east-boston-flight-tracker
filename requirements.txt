@@ -1,0 +1,1 @@
+# No third-party dependencies — stdlib only (http.server, urllib, json, os, sys)
