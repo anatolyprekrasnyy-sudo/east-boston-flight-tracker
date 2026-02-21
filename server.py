@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -371,7 +372,8 @@ if __name__ == "__main__":
 
     if CLIENT_ID:
         auth_line = f"✓  client_id loaded: '{CLIENT_ID}'"
-        _fetch_token()   # warm up token on start
+        # Fetch token in background so server starts immediately (avoids healthcheck timeout)
+        threading.Thread(target=_fetch_token, daemon=True).start()
     else:
         auth_line = ("⚠  No credentials — anonymous mode\n"
                      "   Go to your OpenSky account → API Clients → Create client\n"
