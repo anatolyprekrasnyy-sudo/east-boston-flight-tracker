@@ -93,18 +93,21 @@ def _fetch_token() -> str:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            payload = json.loads(r.read())
-            _token         = payload["access_token"]
-            expires_in     = int(payload.get("expires_in", 300))
-            _token_expiry  = time.time() + expires_in - TOKEN_GRACE
-            print(f"  ✓  OAuth2 token obtained (expires in {expires_in}s)")
-            return _token
-    except Exception as exc:
-        print(f"  ✗  Token fetch failed: {exc}")
-        _token, _token_expiry = "", 0.0
-        return ""
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                payload = json.loads(r.read())
+                _token         = payload["access_token"]
+                expires_in     = int(payload.get("expires_in", 300))
+                _token_expiry  = time.time() + expires_in - TOKEN_GRACE
+                print(f"  ✓  OAuth2 token obtained (expires in {expires_in}s)")
+                return _token
+        except Exception as exc:
+            print(f"  ✗  Token fetch attempt {attempt+1}/3 failed: {exc}")
+            if attempt < 2:
+                time.sleep(3)
+    _token, _token_expiry = "", 0.0
+    return ""
 
 
 def _get_token() -> str:
