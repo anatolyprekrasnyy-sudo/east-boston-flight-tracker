@@ -819,7 +819,7 @@
 
   <!-- ─── Footer ──────────────────────────────────────────────────────────── -->
   <footer>
-    <div>Data sourced from <a href="https://opensky-network.org" target="_blank" rel="noopener">OpenSky Network</a> — live ADS-B aggregation.</div>
+    <div>Data sourced from <a href="https://api.adsb.lol" target="_blank" rel="noopener">adsb.lol</a> — live ADS-B aggregation.</div>
     <div>Window mode: 42.365–42.375°N / 71.045–71.030°W · &lt;2,500 ft &nbsp;|&nbsp; Expand mode: ~3 mi radius Logan · &lt;10,000 ft</div>
     <div>RWY 33L ≈330° · RWY 15R ≈150° · RWY 04R ≈40° · RWY 22L ≈220° · RWY 09 ≈90° · RWY 27 ≈270° &nbsp;(±18–22° tolerance)</div>
   </footer>
@@ -1219,15 +1219,31 @@ function annotatePlanes(states) {
     const vr    = sv[F.vert_rate];
     const vrFpm = mpsToFpm(vr);
 
+    const altFt = altitudeFeet(sv);
+    const lat   = sv[F.lat];
+    const lon   = sv[F.lon];
+
+    // If the scheduled route says a non-BOS origin but the aircraft is
+    // clearly departing BOS (below 10,000 ft, climbing, within ~10 nm of
+    // Logan), override origin to BOS so we don't show a wrong city.
+    const BOS_LAT = 42.3656, BOS_LON = -71.0096;
+    const distFromBos = Math.hypot((lat - BOS_LAT) * 69, (lon - BOS_LON) * 52); // rough miles
+    const isDepartingBos = distFromBos < 10 && altFt !== null && altFt < 10000 && vrFpm > 200;
+    const scheduledOrigin = route?.origin_iata || null;
+    const originIata = isDepartingBos && scheduledOrigin && scheduledOrigin !== 'BOS'
+      ? 'BOS' : (scheduledOrigin || null);
+    const originCity = isDepartingBos && scheduledOrigin && scheduledOrigin !== 'BOS'
+      ? 'Boston' : (route?.origin_city || null);
+
     return {
       icao24,
       cs,
-      altFt:        altitudeFeet(sv),
+      altFt,
       spd:          mpsToKnots(sv[F.velocity]),
       hdg,
       vrFpm,
-      lat:          sv[F.lat],
-      lon:          sv[F.lon],
+      lat,
+      lon,
       rwId,
       cssClass:     meta ? meta.cssClass : 'other',
       label:        meta ? meta.label    : null,
@@ -1236,8 +1252,8 @@ function annotatePlanes(states) {
       logoUrl,
       aircraftType: acInfo?.type || null,
       // Route
-      originIata:   route?.origin_iata  || null,
-      originCity:   route?.origin_city  || null,
+      originIata,
+      originCity,
       destIata:     route?.dest_iata    || null,
       destCity:     route?.dest_city    || null,
     };
