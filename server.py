@@ -2,120 +2,133 @@
 """
 Flight Tracker – local proxy server
   GET /           → serves index.html
-  GET /api/opensky?... → proxies OpenSky Network API (OAuth2 Bearer token)
+  GET /api/opensky?... → fetches from adsb.lol (free, no auth, reachable from Railway)
+                         and translates response into OpenSky states array format
   GET /api/status      → auth status
-  POST /api/save-credentials → save client_id + client_secret
+  POST /api/save-credentials → save client_id + client_secret (no longer needed for
+                               flight data, kept for UI compatibility)
 
-OpenSky moved to OAuth2 client credentials for all accounts created after
-mid-March 2025. Basic auth (username/password) is deprecated.
-
-To get your client_id and client_secret:
-  1. Log in at https://opensky-network.org
-  2. Go to Account → API Clients → Create new client
-  3. Copy the client_id and client_secret shown
-  4. Enter them in the dashboard's "Fix credentials" modal
+Flight data source: api.adsb.lol — free ADS-B aggregator, no authentication required.
+OpenSky Network's auth server (auth.opensky-network.org) is unreachable from Railway's
+network, so adsb.lol is used as the primary data source instead.
 
 Usage:
   python3 server.py
-  python3 server.py CLIENT_ID CLIENT_SECRET
 """
 
-import base64
 import json
+import math
 import os
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PORT        = int(os.environ.get("PORT", 8765))
-OPENSKY_API = "https://opensky-network.org/api/states/all"
-OPENSKY_AC  = "https://opensky-network.org/api/metadata/aircraft/icao/"
-ADSBDB_ROUTE= "https://api.adsbdb.com/v0/callsign/"
-ADSBDB_AC   = "https://api.adsbdb.com/v0/aircraft/"
-TOKEN_URL   = ("https://auth.opensky-network.org/auth/realms/opensky-network"
-               "/protocol/openid-connect/token")
-CACHE_SECS  = 10          # don't re-hit OpenSky more often than this
-TOKEN_GRACE = 60          # refresh token this many seconds before expiry
-HERE        = os.path.dirname(os.path.abspath(__file__))
-CREDS_FILE  = os.path.join(HERE, "credentials.txt")
+PORT         = int(os.environ.get("PORT", 8765))
+ADSBDB_ROUTE = "https://api.adsbdb.com/v0/callsign/"
+ADSBDB_AC    = "https://api.adsbdb.com/v0/aircraft/"
+ADSBDB_LOL   = "https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{dist}"
+CACHE_SECS   = 10          # don't re-hit data source more often than this
+HERE         = os.path.dirname(os.path.abspath(__file__))
+CREDS_FILE   = os.path.join(HERE, "credentials.txt")
 
 # Long-lived caches (aircraft reg/type doesn't change, routes rarely change)
 _ac_cache: dict    = {}   # icao24 -> metadata dict
 _route_cache: dict = {}   # callsign -> route dict
 
-# ── Load credentials: CLI args → env vars → credentials.txt → empty ──────────
-def _load_creds():
-    if len(sys.argv) > 2:
-        return sys.argv[1], sys.argv[2]
-    # Cloud deployment: read from environment variables
-    env_id  = os.environ.get("OPENSKY_CLIENT_ID", "").strip()
-    env_sec = os.environ.get("OPENSKY_CLIENT_SECRET", "").strip()
-    if env_id and env_sec:
-        return env_id, env_sec
-    if os.path.exists(CREDS_FILE):
-        try:
-            line = open(CREDS_FILE).read().strip()
-            if ":" in line:
-                u, p = line.split(":", 1)
-                return u.strip(), p.strip()
-        except Exception:
-            pass
-    return "", ""
-
-CLIENT_ID, CLIENT_SECRET = _load_creds()
-
-# ── Token cache ───────────────────────────────────────────────────────────────
-_token: str   = ""
-_token_expiry: float = 0.0   # epoch seconds when token expires
-
 # ── Response cache ────────────────────────────────────────────────────────────
 _cache: dict = {}  # qs → {"ts": float, "status": int, "body": bytes}
 
 
-def _fetch_token() -> str:
-    """Exchange client credentials for a Bearer token. Returns token or ''."""
-    global _token, _token_expiry
-    if not CLIENT_ID or not CLIENT_SECRET:
-        return ""
+def _adsbdblol_to_opensky_states(ac_list: list) -> list:
+    """Convert adsb.lol aircraft list to OpenSky states array format.
 
-    data = urllib.parse.urlencode({
-        "grant_type":    "client_credentials",
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-    }).encode()
+    OpenSky state vector indices (from index.html):
+      0  icao24       hex transponder address
+      1  callsign     flight number / tail
+      2  origin_country
+      3  time_position
+      4  last_contact
+      5  longitude
+      6  latitude
+      7  baro_altitude  (metres)
+      8  on_ground
+      9  velocity       (m/s)
+      10 true_track     (degrees)
+      11 vertical_rate  (m/s)
+      12 sensors
+      13 geo_altitude   (metres)
+      14 squawk
+      15 spi
+      16 position_source
+    """
+    FT_TO_M  = 0.3048
+    KT_TO_MS = 0.514444
+    FPM_TO_MS = 0.00508
 
-    req = urllib.request.Request(
-        TOKEN_URL,
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                payload = json.loads(r.read())
-                _token         = payload["access_token"]
-                expires_in     = int(payload.get("expires_in", 300))
-                _token_expiry  = time.time() + expires_in - TOKEN_GRACE
-                print(f"  ✓  OAuth2 token obtained (expires in {expires_in}s)")
-                return _token
-        except Exception as exc:
-            print(f"  ✗  Token fetch attempt {attempt+1}/3 failed: {exc}")
-            if attempt < 2:
-                time.sleep(3)
-    _token, _token_expiry = "", 0.0
-    return ""
+    states = []
+    for ac in ac_list:
+        # Skip aircraft with no position
+        if ac.get("lat") is None or ac.get("lon") is None:
+            continue
 
+        icao24   = (ac.get("hex") or "").lower()
+        callsign = (ac.get("flight") or "").strip()
+        on_ground = ac.get("alt_baro") == "ground"
 
-def _get_token() -> str:
-    """Return a valid token, refreshing if necessary."""
-    if _token and time.time() < _token_expiry:
-        return _token
-    return _fetch_token()
+        # Altitude: adsb.lol gives feet, OpenSky expects metres
+        alt_baro = ac.get("alt_baro")
+        if alt_baro == "ground" or alt_baro is None:
+            baro_alt = None
+        else:
+            try:
+                baro_alt = float(alt_baro) * FT_TO_M
+            except (TypeError, ValueError):
+                baro_alt = None
+
+        alt_geom = ac.get("alt_geom")
+        if alt_geom is None:
+            geo_alt = None
+        else:
+            try:
+                geo_alt = float(alt_geom) * FT_TO_M
+            except (TypeError, ValueError):
+                geo_alt = None
+
+        # Speed: adsb.lol gives knots, OpenSky expects m/s
+        gs = ac.get("gs")
+        velocity = float(gs) * KT_TO_MS if gs is not None else None
+
+        # Vertical rate: adsb.lol gives ft/min, OpenSky expects m/s
+        vr = ac.get("baro_rate") or ac.get("geom_rate")
+        vert_rate = float(vr) * FPM_TO_MS if vr is not None else None
+
+        heading = ac.get("track") or ac.get("true_heading")
+        squawk  = ac.get("squawk") or ""
+
+        now = int(time.time())
+        states.append([
+            icao24,           # 0
+            callsign,         # 1
+            "",               # 2  origin_country (not provided)
+            now,              # 3  time_position
+            now,              # 4  last_contact
+            ac.get("lon"),    # 5
+            ac.get("lat"),    # 6
+            baro_alt,         # 7
+            on_ground,        # 8
+            velocity,         # 9
+            heading,          # 10
+            vert_rate,        # 11
+            None,             # 12 sensors
+            geo_alt,          # 13
+            squawk,           # 14
+            False,            # 15 spi
+            0,                # 16 position_source (0=ADS-B)
+        ])
+    return states
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -126,8 +139,9 @@ class Handler(BaseHTTPRequestHandler):
     def send_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
 
-    # ── Proxy OpenSky ─────────────────────────────────────────────────────────
+    # ── Proxy flight data via adsb.lol ────────────────────────────────────────
     def proxy_opensky(self, qs):
+        """Fetch from adsb.lol and return OpenSky-compatible states array."""
         global _cache
         now = time.time()
 
@@ -141,21 +155,37 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(c["body"])
             return
 
-        url = OPENSKY_API + ("?" + qs if qs else "")
-        headers = {"User-Agent": "EastBostonFlightTracker/3.0", "Accept": "application/json"}
+        # Parse bounding box from query string (lamin, lomin, lamax, lomax)
+        params = dict(urllib.parse.parse_qsl(qs))
+        try:
+            lamin = float(params["lamin"])
+            lamax = float(params["lamax"])
+            lomin = float(params["lomin"])
+            lomax = float(params["lomax"])
+            center_lat = (lamin + lamax) / 2
+            center_lon = (lomin + lomax) / 2
+            # Rough radius in nautical miles from bounding box
+            lat_deg = (lamax - lamin) / 2
+            lon_deg = (lomax - lomin) / 2
+            dist_nm = int(math.ceil(max(lat_deg, lon_deg) * 60)) + 5
+            dist_nm = max(10, min(dist_nm, 250))
+        except (KeyError, ValueError):
+            # No bbox — use East Boston defaults
+            center_lat, center_lon, dist_nm = 42.37, -71.04, 25
 
-        token = _get_token()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
-        req = urllib.request.Request(url, headers=headers)
+        url = ADSBDB_LOL.format(lat=center_lat, lon=center_lon, dist=dist_nm)
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "EastBostonFlightTracker/3.0", "Accept": "application/json"},
+        )
         try:
             with urllib.request.urlopen(req, timeout=12) as resp:
-                body   = resp.read()
-                status = resp.status
-        except urllib.error.HTTPError as e:
-            body   = e.read() or b'{"error":"upstream error"}'
-            status = e.code
+                data    = json.loads(resp.read())
+                ac_list = data.get("ac") or []
+                states  = _adsbdblol_to_opensky_states(ac_list)
+                body    = json.dumps({"time": int(now), "states": states}).encode()
+                status  = 200
+                print(f"  adsb.lol: {len(states)} aircraft in view")
         except Exception as exc:
             body   = json.dumps({"error": str(exc)}).encode()
             status = 502
@@ -185,42 +215,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"index.html not found")
 
-    # ── Save credentials ──────────────────────────────────────────────────────
+    # ── Save credentials (kept for UI compatibility, no longer needed) ────────
     def save_credentials(self, body_bytes):
-        global CLIENT_ID, CLIENT_SECRET, _token, _token_expiry, _cache
+        global _cache
         try:
             payload   = json.loads(body_bytes)
             client_id = payload.get("client_id", "").strip()
-            client_secret = payload.get("client_secret", "").strip()
         except Exception:
             self._json_response(400, {"error": "bad json"})
             return
-
-        if not client_id or not client_secret:
-            self._json_response(400, {"error": "client_id and client_secret required"})
-            return
-
-        with open(CREDS_FILE, "w") as f:
-            f.write(f"{client_id}:{client_secret}\n")
-
-        CLIENT_ID     = client_id
-        CLIENT_SECRET = client_secret
-        _token        = ""
-        _token_expiry = 0.0
         _cache.clear()
-
-        # Immediately test by fetching a token
-        tok = _get_token()
-        if not tok:
-            self._json_response(401, {"error": "Credentials saved but token fetch failed — check client_id and client_secret"})
-            return
-
-        print(f"  ✓  Credentials saved for client '{client_id}'")
+        print(f"  ✓  Credentials received for '{client_id}' (flight data via adsb.lol, no token needed)")
         self._json_response(200, {"ok": True, "client_id": client_id})
 
     # ── Aircraft metadata ──────────────────────────────────────────────────────
     def proxy_aircraft(self, icao24):
-        """Try adsbdb first (richer data), fall back to OpenSky metadata."""
+        """Fetch aircraft metadata from adsbdb (no auth needed)."""
         global _ac_cache
         icao24 = icao24.lower().strip()
         if icao24 in _ac_cache:
@@ -228,8 +238,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         result = {}
-
-        # 1. Try adsbdb (no auth needed, has owner/operator flag)
         try:
             req = urllib.request.Request(
                 ADSBDB_AC + icao24.upper(),
@@ -247,27 +255,6 @@ class Handler(BaseHTTPRequestHandler):
                     }
         except Exception:
             pass
-
-        # 2. Fall back to OpenSky metadata if adsbdb gave nothing
-        if not result:
-            try:
-                url = OPENSKY_AC + icao24
-                headers = {"User-Agent": "EastBostonFlightTracker/3.0", "Accept": "application/json"}
-                token = _get_token()
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    d = json.loads(resp.read())
-                    result = {
-                        "type":         d.get("typecode") or d.get("type") or "",
-                        "model":        d.get("model") or "",
-                        "registration": d.get("registration") or "",
-                        "operator":     d.get("owner") or d.get("operator") or "",
-                        "operatorIcao": d.get("operatorIcao") or "",
-                    }
-            except Exception:
-                pass
 
         _ac_cache[icao24] = result
         self._json_response(200, result)
@@ -319,9 +306,10 @@ class Handler(BaseHTTPRequestHandler):
     # ── Server status ─────────────────────────────────────────────────────────
     def send_status(self):
         self._json_response(200, {
-            "authenticated": bool(CLIENT_ID),
-            "client_id": CLIENT_ID if CLIENT_ID else None,
-            "token_valid": bool(_token and time.time() < _token_expiry),
+            "authenticated": True,
+            "client_id": "adsb.lol",
+            "token_valid": True,
+            "source": "adsb.lol",
         })
 
     # ── Helper ────────────────────────────────────────────────────────────────
@@ -370,16 +358,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.chdir(HERE)
 
-    if CLIENT_ID:
-        auth_line = f"✓  client_id loaded: '{CLIENT_ID}'"
-        # Fetch token in background so server starts immediately (avoids healthcheck timeout)
-        threading.Thread(target=_fetch_token, daemon=True).start()
-    else:
-        auth_line = ("⚠  No credentials — anonymous mode\n"
-                     "   Go to your OpenSky account → API Clients → Create client\n"
-                     "   Then enter client_id + client_secret in the dashboard modal\n"
-                     "   Or run:  python3 server.py CLIENT_ID CLIENT_SECRET")
-
     print(f"""
   ╔══════════════════════════════════════════════════════╗
   ║        ✈  East Boston Flight Tracker Server          ║
@@ -388,7 +366,7 @@ if __name__ == "__main__":
   Open in browser →  http://localhost:{PORT}  (local)
   Listening on     :  0.0.0.0:{PORT}
 
-  Auth          :  {auth_line}
+  Data source   :  adsb.lol (free ADS-B, no auth required)
   Cache TTL     :  {CACHE_SECS}s
 
   Press Ctrl+C to stop.
